@@ -1,0 +1,360 @@
+#!/bin/zsh
+# Starts one IntelliJ IDEA JVM as an isolated, local-only MCP backend.
+#
+# Required once: download a supported jetbrains-index-mcp-plugin ZIP and set
+# BB_IDEA_MCP_PLUGIN_ZIP to its absolute path. IDEA 2025.3+ is required.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/jb-backend start [project-path]
+  scripts/jb-backend status [project-path]
+  scripts/jb-backend stop [project-path]
+  scripts/jb-backend log [project-path]
+
+Environment:
+  BB_IDEA_HOME                IDEA application bundle (default: /Applications/IntelliJ IDEA.app)
+  BB_IDEA_MCP_PLUGIN_ZIP      Signed jetbrains-index-mcp-plugin ZIP (required)
+  BB_IDEA_BACKEND_STATE_DIR   Backend state root (default: ~/.bb/idea-backends)
+  BB_IDEA_BACKEND_PORT        Fixed loopback port for the shared backend (optional)
+
+The first start opens a project and starts the JVM. Later starts add projects
+to the same JVM through ide_open_project. The MCP server binds to 127.0.0.1
+and must never be exposed to a network.
+EOF
+}
+
+die() {
+  print -u2 -- "jb-backend: $*"
+  exit 1
+}
+
+command_name="${1:-}"
+[[ -n "$command_name" ]] || { usage; exit 2; }
+case "$command_name" in
+  start|status|stop|log) ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) usage; exit 2 ;;
+esac
+
+project_input="${2:-$PWD}"
+[[ -d "$project_input" ]] || die "project directory does not exist: $project_input"
+project_path="$(cd "$project_input" && pwd -P)"
+
+idea_home="${BB_IDEA_HOME:-/Applications/IntelliJ IDEA.app}"
+idea_contents="$idea_home/Contents"
+product_info="$idea_contents/Resources/product-info.json"
+idea_java="$idea_contents/jbr/Contents/Home/bin/java"
+idea_javac="$idea_contents/jbr/Contents/Home/bin/javac"
+idea_jar="$idea_contents/jbr/Contents/Home/bin/jar"
+[[ -f "$product_info" ]] || die "IDEA product metadata does not exist: $product_info"
+[[ -x "$idea_java" ]] || die "bundled IDEA Java runtime is not executable: $idea_java"
+[[ -x "$idea_javac" ]] || die "bundled IDEA Java compiler is not executable: $idea_javac"
+if [[ ! -x "$idea_jar" ]]; then
+  idea_jar="$(command -v jar || true)"
+fi
+[[ -n "$idea_jar" && -x "$idea_jar" ]] || die "a JDK jar tool is required to build the headless starter"
+
+script_dir="${0:A:h}"
+
+state_root="${BB_IDEA_BACKEND_STATE_DIR:-$HOME/.bb/idea-backends}"
+instance_dir="$state_root/shared"
+config_dir="$instance_dir/config"
+system_dir="$instance_dir/system"
+plugins_dir="$config_dir/plugins"
+pid_file="$instance_dir/pid"
+port_file="$instance_dir/port"
+projects_file="$instance_dir/projects"
+log_file="$instance_dir/launcher.log"
+start_lock_file="$instance_dir/start.lock"
+mcp_url=""
+
+is_running() {
+  local candidate
+  for candidate in "$pid_file" "$system_dir/.pid"; do
+    [[ -f "$candidate" ]] || continue
+    local pid
+    pid="$(<"$candidate")"
+    if [[ "$pid" == <-> ]] && kill -0 "$pid" 2>/dev/null; then
+      [[ "$candidate" == "$pid_file" ]] || print -r -- "$pid" > "$pid_file"
+      return 0
+    fi
+  done
+
+  if port_is_listening; then
+    local port listener_pid
+    port="$(<"$port_file")"
+    listener_pid="$(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -n 1)"
+    if [[ "$listener_pid" == <-> ]]; then
+      print -r -- "$listener_pid" > "$pid_file"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+port_is_listening() {
+  [[ -f "$port_file" ]] || return 1
+  local port response
+  port="$(<"$port_file")"
+  [[ "$port" == <-> ]] || return 1
+  response="$(curl -sS --fail --max-time 2 \
+    -X POST "http://127.0.0.1:$port/index-mcp/streamable-http" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    --data '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"bb-jb-backend","version":"1"}}}' \
+    2>/dev/null)" || return 1
+  jq -e '.result.serverInfo.name == "intellij-index"' <<<"$response" >/dev/null 2>&1
+}
+
+choose_port() {
+  if [[ -n "${BB_IDEA_BACKEND_PORT:-}" ]]; then
+    [[ "$BB_IDEA_BACKEND_PORT" == <1024-65535> ]] || die "BB_IDEA_BACKEND_PORT must be between 1024 and 65535"
+    ! lsof -nP -iTCP:"$BB_IDEA_BACKEND_PORT" -sTCP:LISTEN >/dev/null 2>&1 || die "port is already in use: $BB_IDEA_BACKEND_PORT"
+    print -r -- "$BB_IDEA_BACKEND_PORT"
+    return
+  fi
+
+  local candidate
+  for candidate in {29180..29279}; do
+    if ! lsof -nP -iTCP:"$candidate" -sTCP:LISTEN >/dev/null 2>&1; then
+      print -r -- "$candidate"
+      return
+    fi
+  done
+  die "no free port found in 29180-29279; set BB_IDEA_BACKEND_PORT"
+}
+
+write_mcp_settings() {
+  local port="$1"
+  mkdir -p "$config_dir/options"
+  cat > "$config_dir/options/mcp-plugin.xml" <<EOF
+<application>
+  <component name="McpPluginSettings">
+    <option name="serverHost" value="127.0.0.1" />
+    <option name="serverPort" value="$port" />
+    <option name="settingsSchemaVersion" value="7" />
+    <option name="disabledTools">
+      <set>
+        <option value="ide_build_project" />
+        <option value="ide_close_project" />
+        <option value="ide_create_module" />
+        <option value="ide_import_modules" />
+        <option value="ide_list_tests" />
+        <option value="ide_reload_project" />
+        <option value="ide_file_structure" />
+        <option value="ide_find_symbol" />
+        <option value="ide_open_workspace" />
+        <option value="ide_read_file" />
+        <option value="ide_get_active_file" />
+        <option value="ide_open_file" />
+        <option value="ide_reformat_code" />
+        <option value="ide_optimize_imports" />
+        <option value="ide_convert_java_to_kotlin" />
+        <option value="ide_run_tests" />
+        <option value="ide_set_power_save_mode" />
+        <option value="ide_install_plugin" />
+        <option value="ide_restart_ide" />
+        <option value="ide_enroll_all_projects" />
+        <option value="ide_get_project_modes" />
+        <option value="ide_lifecycle_log" />
+        <option value="ide_lifecycle_log_file" />
+        <option value="ide_release_all_projects" />
+        <option value="ide_release_project" />
+        <option value="ide_set_all_project_modes" />
+        <option value="ide_set_project_mode" />
+        <option value="ide_change_signature" />
+        <option value="ide_create_file" />
+        <option value="ide_replace_text_in_file" />
+        <option value="ide_structural_search_replace" />
+        <option value="ide_edit_member" />
+        <option value="ide_insert_member" />
+        <option value="ide_replace_member" />
+        <option value="ide_project_diagnostics" />
+      </set>
+    </option>
+  </component>
+</application>
+EOF
+}
+
+record_project() {
+  touch "$projects_file"
+  rg -Fx -- "$project_path" "$projects_file" >/dev/null 2>&1 || print -r -- "$project_path" >> "$projects_file"
+}
+
+open_project() {
+  local context_path payload response
+  context_path="$(head -n 1 "$projects_file")"
+  payload="$(jq -nc --arg path "$project_path" --arg context "$context_path" '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:"ide_open_project",arguments:{path:$path,project_path:$context,timeoutSeconds:600}}}')"
+  response="$(curl -sS --fail --max-time 620 -X POST "$mcp_url" -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' --data "$payload")" || die "could not call ide_open_project at $mcp_url"
+  print -r -- "$response"
+  record_project
+}
+
+install_headless_starter() {
+  local source_file="$script_dir/jb-backend-starter/src/dev/bb/headless/BbBackendStarter.java"
+  local resources_dir="$script_dir/jb-backend-starter/resources"
+  local starter_dir="$plugins_dir/bb-headless-starter"
+  local starter_jar="$starter_dir/lib/bb-headless-starter.jar"
+  local classes_dir="$instance_dir/starter-build/classes"
+
+  [[ -f "$source_file" ]] || die "headless starter source is missing: $source_file"
+  [[ -f "$resources_dir/META-INF/plugin.xml" ]] || die "headless starter descriptor is missing"
+  mkdir -p "$starter_dir/lib" "$classes_dir"
+  "$idea_javac" -cp "$idea_contents/lib/*" -d "$classes_dir" "$source_file"
+  "$idea_jar" --create --file "$starter_jar" \
+    -C "$classes_dir" . \
+    -C "$resources_dir" META-INF/plugin.xml
+}
+
+build_idea_command() {
+  local jar_name option
+  local -a vm_args
+  local classpath=""
+
+  while IFS= read -r jar_name; do
+    [[ -f "$idea_contents/lib/$jar_name" ]] || die "IDEA library is missing: $jar_name"
+    [[ -z "$classpath" ]] || classpath+=":"
+    classpath+="$idea_contents/lib/$jar_name"
+  done < <(jq -r '.launch[] | select(.os == "macOS" and .arch == "aarch64") | .bootClassPathJarNames[]' "$product_info")
+  [[ -n "$classpath" ]] || die "IDEA does not provide an Apple Silicon launch configuration"
+
+  while IFS= read -r option; do
+    [[ -z "$option" || "$option" == \#* ]] && continue
+    option="${option//\$APP_PACKAGE\/Contents/$idea_contents}"
+    option="${option//\$IDE_HOME/$idea_contents}"
+    vm_args+=("$option")
+  done < "$idea_contents/bin/idea.vmoptions"
+  while IFS= read -r option; do
+    option="${option//\$APP_PACKAGE\/Contents/$idea_contents}"
+    option="${option//\$IDE_HOME/$idea_contents}"
+    vm_args+=("$option")
+  done < <(jq -r '.launch[] | select(.os == "macOS" and .arch == "aarch64") | .additionalJvmArguments[]?' "$product_info")
+
+  command=(
+    "$idea_java"
+    "${vm_args[@]}"
+    "-Didea.home.path=$idea_contents"
+    "-Didea.config.path=$config_dir"
+    "-Didea.system.path=$system_dir"
+    "-Didea.plugins.path=$plugins_dir"
+    "-Didea.log.path=$system_dir/log"
+    '-Djava.awt.headless=true'
+    '-Didea.config.import.enabled=false'
+    '-Didea.initially.ask.config=never'
+    '-Dide.no.platform.update=true'
+    '-Dide.show.tips.on.startup.default.value=false'
+    '-Djdk.configure.existing=true'
+    '-Dnosplash=true'
+    -classpath "$classpath"
+    com.intellij.idea.Main
+    bbBackend "$project_path"
+  )
+}
+
+case "$command_name" in
+  status)
+    if is_running; then
+      if port_is_listening; then
+        mcp_url="http://127.0.0.1:$(<"$port_file")/index-mcp/streamable-http"
+        print -- "running: $project_path"
+        print -- "pid: $(<"$pid_file")"
+        print -- "mcp: $mcp_url"
+      else
+        print -- "starting: $project_path (pid $(<"$pid_file"), MCP port not listening yet)"
+      fi
+      exit 0
+    fi
+    print -- "stopped: $project_path"
+    exit 1
+    ;;
+  log)
+    [[ -f "$log_file" ]] || die "no log exists for this project yet"
+    tail -n 200 -f "$log_file"
+    ;;
+  stop)
+    if ! is_running; then
+      rm -f "$pid_file"
+      print -- "already stopped: $project_path"
+      exit 0
+    fi
+    pid="$(<"$pid_file")"
+    kill -TERM "$pid"
+    for _ in {1..30}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 1
+    done
+    kill -0 "$pid" 2>/dev/null && die "process $pid did not stop; inspect $log_file"
+    rm -f "$pid_file"
+    print -- "stopped: $project_path"
+    exit 0
+    ;;
+esac
+
+if is_running && port_is_listening; then
+  mcp_url="http://127.0.0.1:$(<"$port_file")/index-mcp/streamable-http"
+  print -- "adding project to shared backend: $project_path"
+  open_project
+  exit 0
+fi
+
+mkdir -p "$instance_dir"
+touch "$start_lock_file"
+zmodload zsh/system || die "zsh/system is required for the shared startup lock"
+typeset backend_lock_fd
+zsystem flock -t 180 -f backend_lock_fd "$start_lock_file" || die "timed out waiting for another backend start"
+
+if is_running; then
+  port_is_listening || die "the shared IDEA process is running, but MCP is not ready; inspect $log_file"
+  mcp_url="http://127.0.0.1:$(<"$port_file")/index-mcp/streamable-http"
+  print -- "adding project to shared backend: $project_path"
+  open_project
+  exit 0
+fi
+
+plugin_zip="${BB_IDEA_MCP_PLUGIN_ZIP:-}"
+[[ -n "$plugin_zip" ]] || die "set BB_IDEA_MCP_PLUGIN_ZIP to the signed MCP plugin ZIP"
+[[ -f "$plugin_zip" ]] || die "MCP plugin ZIP does not exist: $plugin_zip"
+
+mkdir -p "$config_dir" "$system_dir" "$plugins_dir"
+print -r -- "$project_path" > "$projects_file"
+if ! find "$plugins_dir/jetbrains-index-mcp-plugin/lib" -maxdepth 1 -name 'jetbrains-index-mcp-plugin-*.jar' -print -quit 2>/dev/null | rg -q .; then
+  unzip -q -o "$plugin_zip" -d "$plugins_dir"
+fi
+install_headless_starter
+
+port="$(choose_port)"
+print -r -- "$port" > "$port_file"
+write_mcp_settings "$port"
+
+typeset -a command
+build_idea_command
+nohup "${command[@]}" > "$log_file" 2>&1 &
+pid=$!
+print -r -- "$pid" > "$pid_file"
+
+for _ in {1..180}; do
+  if [[ -f "$system_dir/.pid" ]]; then
+    backend_pid="$(<"$system_dir/.pid")"
+    if [[ "$backend_pid" == <-> ]] && kill -0 "$backend_pid" 2>/dev/null; then
+      print -r -- "$backend_pid" > "$pid_file"
+      pid="$backend_pid"
+    fi
+  fi
+  if port_is_listening; then
+    mcp_url="http://127.0.0.1:$port/index-mcp/streamable-http"
+    print -- "running: $project_path"
+    print -- "pid: $pid"
+    print -- "mcp: $mcp_url"
+    exit 0
+  fi
+  if ! kill -0 "$pid" 2>/dev/null && ! is_running; then
+    rm -f "$pid_file"
+    die "IDE exited before MCP was ready; inspect $log_file"
+  fi
+  sleep 1
+done
+
+die "IDE is still starting after 180 seconds; inspect $log_file"

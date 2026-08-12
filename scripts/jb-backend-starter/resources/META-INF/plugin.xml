@@ -1,0 +1,10 @@
+<idea-plugin>
+  <id>dev.bb.headless.starter</id>
+  <name>BB Headless Backend Starter</name>
+  <version>0.1.0</version>
+  <vendor>BB</vendor>
+  <depends>com.intellij.modules.platform</depends>
+  <extensions defaultExtensionNs="com.intellij">
+    <appStarter id="bbBackend" implementation="dev.bb.headless.BbBackendStarter" />
+  </extensions>
+</idea-plugin>
