@@ -18,6 +18,9 @@ not an installable BB plugin yet.
 - [`docs/bb-ide-service-plan.md`](docs/bb-ide-service-plan.md) — product idea,
   provider architecture, resource ownership model, CLI and implementation
   plan.
+- [`docs/change-review-ide-integration.md`](docs/change-review-ide-integration.md)
+  — integration contract between Change Review and the IDE service, including
+  cross-plugin transport and navigation into external dependencies.
 
 ## Prototype usage
 

@@ -2,6 +2,7 @@
 
 Статус: draft
 Связанное исследование: [JetBrains IDEA как backend для BB](./jetbrains-idea-backend-for-bb.md)
+Связанная интеграция: [Change Review и BB IDE service](./change-review-ide-integration.md)
 
 ## Идея
 
@@ -303,6 +304,8 @@ bb-ide/
 ```
 
 Плагин регистрирует `bb ide` через CLI API, панель состояния и agent-facing tools. Все они вызывают один service layer. Java starter распространяется заранее собранным по поддерживаемым major-версиям IDEA; runtime compilation остаётся только dev-инструментом.
+
+Change Review и другие UI-плагины обращаются к тому же service layer через versioned JSON-контракт `fileReference`. В первом инкременте межплагиновый transport — `bb.sdk.plugins.callRpc`; CLI остаётся отдельным адаптером для человека и агента, а не внутренней шиной редактора. Переходы возвращают `DocumentRef`, поэтому могут открывать как workspace-файлы, так и read-only документы из `node_modules`, Maven/Gradle caches, source JAR и IDEA virtual/decompiled files. Полное решение описано в [заметке об интеграции](./change-review-ide-integration.md).
 
 Нужный host primitive ориентировочно выглядит так:
 
